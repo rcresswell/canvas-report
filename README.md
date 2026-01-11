@@ -5,7 +5,7 @@ A command-line tool for parents to see what's missing, what's due today, what's 
 ## Example
 
 ```
-$ canvas-report
+$ ./canvas-report
 [✔] Jane Doe: 12/12 courses... done (256 assignments)
 [✔] Tommy Doe: 9/9 courses... done (226 assignments)
 

@@ -1,5 +1,5 @@
-// ABOUTME: Generates formatted reports of Canvas assignments.
-// ABOUTME: Filters for missing, zero-graded, and upcoming assignments across all observed students.
+// ABOUTME: Generates formatted reports of Canvas assignments and grades.
+// ABOUTME: Shows missing, upcoming, and week-ahead assignments plus current grades by grading period.
 
 package main
 
@@ -110,6 +110,19 @@ type studentData struct {
 	weekAhead        []EnrichedAssignment
 	upcomingPending  int
 	weekAheadPending int
+	grades           []periodGrades
+}
+
+type periodGrades struct {
+	period GradingPeriod
+	grades []CourseGrade
+}
+
+type CourseGrade struct {
+	CourseName     string
+	Points         float64
+	PointsPossible float64
+	Percent        float64
 }
 
 func NewReport(client *CanvasClient, showAll bool) *Report {
@@ -182,8 +195,15 @@ func (r *Report) fetchStudentData(student Observee) (studentData, error) {
 
 	assignments := r.fetchAllAssignments(courses, student.ID, s, name)
 
+	s.Suffix = fmt.Sprintf("] %s: fetching grades...", name)
+	grades := r.fetchAllGrades(courses, student.ID)
+
 	s.Stop()
-	fmt.Fprintf(os.Stderr, "[✔] %s: %d/%d courses... done (%d assignments)\n", name, len(courses), len(courses), len(assignments))
+	gradeCount := 0
+	for _, pg := range grades {
+		gradeCount += len(pg.grades)
+	}
+	fmt.Fprintf(os.Stderr, "[✔] %s: %d courses, %d assignments, %d grades\n", name, len(courses), len(assignments), gradeCount)
 
 	missing := r.missingAssignments(assignments)
 	upcoming := r.upcomingAssignments(assignments)
@@ -196,6 +216,7 @@ func (r *Report) fetchStudentData(student Observee) (studentData, error) {
 		weekAhead:        weekAhead,
 		upcomingPending:  countPending(upcoming),
 		weekAheadPending: countPending(weekAhead),
+		grades:           grades,
 	}, nil
 }
 
@@ -272,6 +293,134 @@ func (r *Report) fetchCourseAssignments(course Course, studentID int) ([]Enriche
 	}
 
 	return result, nil
+}
+
+func (r *Report) fetchAllGrades(courses []Course, studentID int) []periodGrades {
+	type courseGradeResult struct {
+		period *GradingPeriod
+		grade  *CourseGrade
+	}
+
+	var results []courseGradeResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, course := range courses {
+		wg.Add(1)
+		go func(c Course) {
+			defer wg.Done()
+
+			period, grade := r.fetchCourseGrade(c, studentID)
+
+			mu.Lock()
+			if period != nil && grade != nil {
+				results = append(results, courseGradeResult{period: period, grade: grade})
+			}
+			mu.Unlock()
+		}(course)
+	}
+
+	wg.Wait()
+
+	// Group by grading period (using title as key since ID can be string or int)
+	periodMap := make(map[string]*periodGrades)
+	for _, res := range results {
+		key := res.period.Title
+		if pg, ok := periodMap[key]; ok {
+			pg.grades = append(pg.grades, *res.grade)
+		} else {
+			periodMap[key] = &periodGrades{
+				period: *res.period,
+				grades: []CourseGrade{*res.grade},
+			}
+		}
+	}
+
+	// Convert map to slice and sort by period start date
+	var grouped []periodGrades
+	for _, pg := range periodMap {
+		// Sort grades by course name within each period
+		sort.Slice(pg.grades, func(i, j int) bool {
+			return pg.grades[i].CourseName < pg.grades[j].CourseName
+		})
+		grouped = append(grouped, *pg)
+	}
+
+	// Sort periods by start date
+	sort.Slice(grouped, func(i, j int) bool {
+		if grouped[i].period.StartDate == nil {
+			return true
+		}
+		if grouped[j].period.StartDate == nil {
+			return false
+		}
+		return grouped[i].period.StartDate.Before(*grouped[j].period.StartDate)
+	})
+
+	return grouped
+}
+
+func (r *Report) fetchCourseGrade(course Course, studentID int) (*GradingPeriod, *CourseGrade) {
+	periods, err := r.client.GradingPeriods(course.ID)
+	if err != nil {
+		return nil, nil
+	}
+
+	current := currentGradingPeriod(periods)
+	if current == nil {
+		return nil, nil
+	}
+
+	// Convert grading period ID to string for API call
+	periodID := fmt.Sprintf("%v", current.ID)
+	enrollments, err := r.client.Enrollments(course.ID, studentID, periodID)
+	if err != nil || len(enrollments) == 0 {
+		return nil, nil
+	}
+
+	enrollment := enrollments[0]
+	if enrollment.Grades.CurrentScore == nil {
+		return nil, nil
+	}
+
+	percent := *enrollment.Grades.CurrentScore
+	points := 0.0
+	if enrollment.Grades.CurrentPoints != nil {
+		points = *enrollment.Grades.CurrentPoints
+	}
+
+	// Calculate points possible from points and percent
+	pointsPossible := 0.0
+	if percent > 0 {
+		pointsPossible = points / (percent / 100)
+	}
+
+	courseName := course.Name
+	if courseName == "" {
+		courseName = "Unknown Course"
+	}
+
+	return current, &CourseGrade{
+		CourseName:     courseName,
+		Points:         points,
+		PointsPossible: pointsPossible,
+		Percent:        percent,
+	}
+}
+
+func currentGradingPeriod(periods []GradingPeriod) *GradingPeriod {
+	now := time.Now()
+	for i := range periods {
+		p := &periods[i]
+		if p.StartDate == nil || p.EndDate == nil {
+			continue
+		}
+		if (now.Equal(*p.StartDate) || now.After(*p.StartDate)) &&
+			(now.Equal(*p.EndDate) || now.Before(*p.EndDate)) {
+			return p
+		}
+	}
+	return nil
 }
 
 func (r *Report) missingAssignments(assignments []EnrichedAssignment) []EnrichedAssignment {
@@ -405,6 +554,9 @@ func (r *Report) printReport(data studentData, colWidths columnWidths) {
 		r.printTable(data.weekAhead, "week_ahead", colWidths)
 	}
 
+	// Grades section
+	r.printGrades(data.grades)
+
 	// Summary
 	fmt.Println()
 	redText := color.New(color.FgRed)
@@ -477,6 +629,54 @@ func (r *Report) printTable(assignments []EnrichedAssignment, sectionType string
 	}
 
 	table.Render()
+}
+
+func (r *Report) printGrades(grades []periodGrades) {
+	if len(grades) == 0 {
+		return
+	}
+
+	magenta := color.New(color.FgMagenta, color.Bold)
+
+	for _, pg := range grades {
+		fmt.Println()
+
+		// Format period header
+		periodName := pg.period.Title
+		if periodName == "" {
+			periodName = "Current Period"
+		}
+		dateRange := ""
+		if pg.period.StartDate != nil && pg.period.EndDate != nil {
+			dateRange = fmt.Sprintf(" (%s - %s)",
+				pg.period.StartDate.Local().Format("Jan 2"),
+				pg.period.EndDate.Local().Format("Jan 2"))
+		}
+		magenta.Printf("GRADES - %s%s\n", periodName, dateRange)
+
+		table := tablewriter.NewWriter(os.Stdout)
+		table.Configure(func(cfg *tablewriter.Config) {
+			cfg.Row.Formatting.AutoWrap = tw.WrapTruncate
+			cfg.Row.Alignment.PerColumn = []tw.Align{
+				tw.AlignLeft,  // Subject
+				tw.AlignRight, // Points
+				tw.AlignRight, // Possible
+				tw.AlignRight, // %
+			}
+		})
+		table.Header("Subject", "Points", "Possible", "%")
+
+		for _, g := range pg.grades {
+			table.Append(
+				g.CourseName,
+				fmt.Sprintf("%.0f", g.Points),
+				fmt.Sprintf("%.0f", g.PointsPossible),
+				fmt.Sprintf("%.2f%%", g.Percent),
+			)
+		}
+
+		table.Render()
+	}
 }
 
 func isCompleted(sub *Submission) bool {

@@ -39,13 +39,27 @@ type Assignment struct {
 }
 
 type Submission struct {
-	AssignmentID                 int        `json:"assignment_id"`
-	SubmittedAt                  *time.Time `json:"submitted_at"`
-	GradedAt                     *time.Time `json:"graded_at"`
-	Score                        *float64   `json:"score"`
-	Missing                      bool       `json:"missing"`
-	Excused                      bool       `json:"excused"`
-	GradeMatchesCurrentSubmission *bool     `json:"grade_matches_current_submission"`
+	AssignmentID                  int        `json:"assignment_id"`
+	SubmittedAt                   *time.Time `json:"submitted_at"`
+	GradedAt                      *time.Time `json:"graded_at"`
+	Score                         *float64   `json:"score"`
+	Missing                       bool       `json:"missing"`
+	Excused                       bool       `json:"excused"`
+	GradeMatchesCurrentSubmission *bool      `json:"grade_matches_current_submission"`
+}
+
+type GradingPeriod struct {
+	ID        any        `json:"id"`
+	Title     string     `json:"title"`
+	StartDate *time.Time `json:"start_date"`
+	EndDate   *time.Time `json:"end_date"`
+}
+
+type Enrollment struct {
+	Grades struct {
+		CurrentScore  *float64 `json:"current_score"`
+		CurrentPoints *float64 `json:"current_points"`
+	} `json:"grades"`
 }
 
 func NewCanvasClient(baseURL, accessToken string) *CanvasClient {
@@ -76,6 +90,51 @@ func (c *CanvasClient) Submissions(courseID, studentID int) ([]Submission, error
 		"per_page":      []string{"100"},
 	}
 	return getPaginated[Submission](c, fmt.Sprintf("/api/v1/courses/%d/students/submissions", courseID), params)
+}
+
+type gradingPeriodsResponse struct {
+	GradingPeriods []GradingPeriod `json:"grading_periods"`
+}
+
+func (c *CanvasClient) GradingPeriods(courseID int) ([]GradingPeriod, error) {
+	fullURL := fmt.Sprintf("%s/api/v1/courses/%d/grading_periods", c.baseURL, courseID)
+
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.accessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Canvas API error: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var result gradingPeriodsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result.GradingPeriods, nil
+}
+
+func (c *CanvasClient) Enrollments(courseID, studentID int, gradingPeriodID string) ([]Enrollment, error) {
+	params := url.Values{
+		"user_id":   []string{fmt.Sprintf("%d", studentID)},
+		"type[]":    []string{"StudentEnrollment"},
+		"include[]": []string{"current_points"},
+	}
+	if gradingPeriodID != "" {
+		params.Set("grading_period_id", gradingPeriodID)
+	}
+	return getPaginated[Enrollment](c, fmt.Sprintf("/api/v1/courses/%d/enrollments", courseID), params)
 }
 
 func getPaginated[T any](c *CanvasClient, path string, params url.Values) ([]T, error) {

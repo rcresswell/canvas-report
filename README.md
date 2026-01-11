@@ -1,6 +1,6 @@
 # canvas-report
 
-A command-line tool for parents to see what's missing, what's due today, and what's coming up this week in Canvas. Supports multiple children.
+A command-line tool for parents to see what's missing, what's due today, what's coming up this week, and current grades in Canvas. Supports multiple children.
 
 ## Example
 
@@ -35,6 +35,16 @@ WEEK AHEAD (2 pending)
 │ Geography                      │ Life in West Africa Comic Strip                      │ wed 1/14 11pm     │    12 │     │
 └────────────────────────────────┴──────────────────────────────────────────────────────┴───────────────────┴───────┴─────┘
 
+GRADES - Q2 (Oct 14 - Jan 17)
+┌─────────────────────────────┬────────┬──────────┬─────────┐
+│ Subject                     │ Points │ Possible │       % │
+├─────────────────────────────┼────────┼──────────┼─────────┤
+│ English Language Arts       │    512 │      550 │  93.09% │
+│ Geography                   │    445 │      480 │  92.71% │
+│ Health & PE                 │    180 │      200 │  90.00% │
+│ Pre-Algebra                 │    423 │      485 │  87.22% │
+└─────────────────────────────┴────────┴──────────┴─────────┘
+
 3 missing | 1 due soon | 2 this week
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -57,6 +67,15 @@ WEEK AHEAD (1 pending)
 ┌────────────────────────────────┬──────────────────────────────────────────────────────┬───────────────────┬───────┬─────┐
 │ Algebra II                     │ Quadratic Functions Quiz                             │ thu 1/15 10am     │    25 │     │
 └────────────────────────────────┴──────────────────────────────────────────────────────┴───────────────────┴───────┴─────┘
+
+GRADES - Q2 (Oct 14 - Jan 17)
+┌─────────────────────────────┬────────┬──────────┬─────────┐
+│ Subject                     │ Points │ Possible │       % │
+├─────────────────────────────┼────────┼──────────┼─────────┤
+│ Algebra II                  │    567 │      600 │  94.50% │
+│ Biology                     │    482 │      500 │  96.40% │
+│ US History                  │    438 │      475 │  92.21% │
+└─────────────────────────────┴────────┴──────────┴─────────┘
 
 0 missing | 2 due soon | 1 this week
 ```

@@ -30,6 +30,7 @@ type columnWidths struct {
 	assignment int
 	due        int
 	pts        int
+	impact     int
 	status     int
 }
 
@@ -38,9 +39,10 @@ func calculateColumnWidths(assignments ...[]EnrichedAssignment) columnWidths {
 	const (
 		dueWidth    = 18 // "thu 12/18 11pm" + padding
 		ptsWidth    = 5
+		impactWidth = 13 // "+10.0/-10.0%" or "+100/-100 pts"
 		statusWidth = 3
-		// Table overhead: 5 column separators (│) + padding (2 per col) = ~17 chars
-		overhead = 17
+		// Table overhead: 6 column separators (│) + padding (2 per col) = ~20 chars
+		overhead = 20
 		minWidth = 80
 	)
 
@@ -67,7 +69,7 @@ func calculateColumnWidths(assignments ...[]EnrichedAssignment) columnWidths {
 	}
 
 	// Available space for subject + assignment
-	flexible := termWidth - dueWidth - ptsWidth - statusWidth - overhead
+	flexible := termWidth - dueWidth - ptsWidth - impactWidth - statusWidth - overhead
 
 	// If everything fits, use actual widths
 	if maxSubject+maxAssignment <= flexible {
@@ -76,6 +78,7 @@ func calculateColumnWidths(assignments ...[]EnrichedAssignment) columnWidths {
 			assignment: maxAssignment,
 			due:        dueWidth,
 			pts:        ptsWidth,
+			impact:     impactWidth,
 			status:     statusWidth,
 		}
 	}
@@ -90,17 +93,26 @@ func calculateColumnWidths(assignments ...[]EnrichedAssignment) columnWidths {
 		assignment: assignmentWidth,
 		due:        dueWidth,
 		pts:        ptsWidth,
+		impact:     impactWidth,
 		status:     statusWidth,
 	}
+}
+
+type AssignmentImpact struct {
+	Gain       float64 // Max improvement if 100% (positive number)
+	Loss       float64 // Loss if 0% (positive number)
+	IsWeighted bool    // Determines display format (% vs pts)
 }
 
 type EnrichedAssignment struct {
 	Name           string
 	CourseName     string
+	CategoryName   string // Weighted category (e.g., "Summative", "Formative")
 	DueAt          time.Time
 	PointsPossible *float64
 	Submission     *Submission
 	Status         string
+	Impact         *AssignmentImpact
 }
 
 type studentData struct {
@@ -168,7 +180,7 @@ func (r *Report) Generate() error {
 
 	// Print all reports with consistent widths
 	// Table width = columns + separators (│) + padding (1 char each side per column)
-	tableWidth := colWidths.subject + colWidths.assignment + colWidths.due + colWidths.pts + colWidths.status + 16
+	tableWidth := colWidths.subject + colWidths.assignment + colWidths.due + colWidths.pts + colWidths.impact + colWidths.status + 19
 
 	for i, data := range allStudents {
 		if i > 0 {
@@ -278,6 +290,43 @@ func (r *Report) fetchCourseAssignments(course Course, studentID int) ([]Enriche
 		return result, fmt.Errorf("fetching submissions: %w", err)
 	}
 
+	// Fetch assignment groups for impact calculation
+	groups, err := r.client.AssignmentGroups(course.ID)
+	if err != nil {
+		groups = nil // Continue without impact if groups fail
+	}
+
+	// Get current grade for impact calculation
+	var currentOverall float64
+	weighted := isWeightedGrading(groups)
+	if groups != nil {
+		periods, _ := r.client.GradingPeriods(course.ID)
+		current := currentGradingPeriod(periods)
+		if current != nil {
+			periodID := fmt.Sprintf("%v", current.ID)
+			enrollments, _ := r.client.Enrollments(course.ID, studentID, periodID)
+			if len(enrollments) > 0 && enrollments[0].Grades.CurrentScore != nil {
+				currentOverall = *enrollments[0].Grades.CurrentScore
+			}
+		}
+	}
+
+	// Calculate impacts
+	var impacts map[int]*AssignmentImpact
+	if groups != nil {
+		impacts = calculateAssignmentImpacts(groups, rawSubmissions, currentOverall, weighted)
+	}
+
+	// Build map of assignment ID to category name (only for weighted courses)
+	categoryByAssignment := make(map[int]string)
+	if weighted && groups != nil {
+		for _, group := range groups {
+			for _, a := range group.Assignments {
+				categoryByAssignment[a.ID] = group.Name
+			}
+		}
+	}
+
 	submissionsByID := make(map[int]*Submission)
 	for i := range rawSubmissions {
 		submissionsByID[rawSubmissions[i].AssignmentID] = &rawSubmissions[i]
@@ -296,9 +345,11 @@ func (r *Report) fetchCourseAssignments(course Course, studentID int) ([]Enriche
 		result = append(result, EnrichedAssignment{
 			Name:           a.Name,
 			CourseName:     courseName,
+			CategoryName:   categoryByAssignment[a.ID],
 			DueAt:          *a.DueAt,
 			PointsPossible: a.PointsPossible,
 			Submission:     submissionsByID[a.ID],
+			Impact:         impacts[a.ID],
 		})
 	}
 
@@ -500,6 +551,287 @@ func (r *Report) buildCategoryGrades(courseID, studentID int, groups []Assignmen
 	return categories
 }
 
+type categoryState struct {
+	points   float64
+	possible float64
+	weight   float64
+}
+
+type submissionInfo struct {
+	score    *float64
+	missing  bool
+	graded   bool // Has GradedAt timestamp
+}
+
+func calculateAssignmentImpacts(
+	groups []AssignmentGroup,
+	submissions []Submission,
+	currentOverall float64,
+	weighted bool,
+) map[int]*AssignmentImpact {
+	impacts := make(map[int]*AssignmentImpact)
+
+	// Build map of assignment submission info
+	subInfoByAssignment := make(map[int]submissionInfo)
+	for _, sub := range submissions {
+		info := submissionInfo{
+			missing: sub.Missing,
+			graded:  sub.GradedAt != nil,
+		}
+		if sub.Score != nil {
+			score := *sub.Score
+			info.score = &score
+		}
+		subInfoByAssignment[sub.AssignmentID] = info
+	}
+
+	// Determine if an assignment is truly graded (score counts in totals)
+	// Missing assignments with score=0 but no GradedAt are NOT in totals
+	isGraded := func(id int) (bool, float64) {
+		info, ok := subInfoByAssignment[id]
+		if !ok || info.score == nil {
+			return false, 0
+		}
+		// If marked missing and score is 0, only count if explicitly graded
+		if info.missing && *info.score == 0 && !info.graded {
+			return false, 0
+		}
+		return true, *info.score
+	}
+
+	// Build current state per category
+	categoryStates := make(map[int]*categoryState)
+
+	for _, group := range groups {
+		state := &categoryState{weight: group.GroupWeight}
+		for _, a := range group.Assignments {
+			if a.PointsPossible == nil || *a.PointsPossible == 0 {
+				continue
+			}
+			if graded, score := isGraded(a.ID); graded {
+				state.points += score
+				state.possible += *a.PointsPossible
+			}
+		}
+		categoryStates[group.ID] = state
+	}
+
+	// For non-weighted courses, calculate total graded points
+	var totalPoints, totalPossible float64
+	if !weighted {
+		for _, state := range categoryStates {
+			totalPoints += state.points
+			totalPossible += state.possible
+		}
+	}
+
+	// Calculate impact for each assignment that could still improve
+	for _, group := range groups {
+		for _, a := range group.Assignments {
+			if a.PointsPossible == nil || *a.PointsPossible == 0 {
+				continue
+			}
+
+			pts := *a.PointsPossible
+			state := categoryStates[group.ID]
+			graded, score := isGraded(a.ID)
+
+			// Skip if graded with non-zero score (no improvement possible in missing context)
+			if graded && score > 0 {
+				continue
+			}
+
+			if graded && score == 0 {
+				// Graded as 0: already in totals, can only improve
+				if weighted {
+					impacts[a.ID] = calculateGradedZeroWeightedImpact(state, pts, currentOverall, categoryStates)
+				} else {
+					impacts[a.ID] = calculateGradedZeroNonWeightedImpact(totalPoints, totalPossible, pts, currentOverall)
+				}
+			} else {
+				// Ungraded: not in totals yet
+				if weighted {
+					impacts[a.ID] = calculateWeightedImpact(state, pts, currentOverall, categoryStates)
+				} else {
+					impacts[a.ID] = calculateNonWeightedImpact(totalPoints, totalPossible, pts, currentOverall)
+				}
+			}
+			impacts[a.ID].IsWeighted = weighted
+		}
+	}
+
+	return impacts
+}
+
+func calculateWeightedImpact(
+	category *categoryState,
+	assignmentPts float64,
+	currentOverall float64,
+	allCategories map[int]*categoryState,
+) *AssignmentImpact {
+	// Zero-weight category has no impact
+	if category.weight == 0 {
+		return &AssignmentImpact{Gain: 0, Loss: 0}
+	}
+
+	// Helper to calculate overall grade with specified category values
+	calcOverall := func(catPoints, catPossible float64, includeCategory bool) float64 {
+		weightedSum := 0.0
+		weightSum := 0.0
+		for _, cat := range allCategories {
+			if cat == category {
+				if includeCategory && catPossible > 0 {
+					catPct := (catPoints / catPossible) * 100
+					weightedSum += catPct * cat.weight
+					weightSum += cat.weight
+				}
+			} else if cat.possible > 0 {
+				catPct := (cat.points / cat.possible) * 100
+				weightedSum += catPct * cat.weight
+				weightSum += cat.weight
+			}
+		}
+
+		if weightSum == 0 {
+			return 0
+		}
+		return weightedSum / weightSum
+	}
+
+	// Calculate current overall (without this assignment)
+	// This ensures we compare apples-to-apples
+	calcCurrentOverall := calcOverall(category.points, category.possible, category.possible > 0)
+
+	// Best case: get 100% on assignment
+	bestCatPts := category.points + assignmentPts
+	bestCatPossible := category.possible + assignmentPts
+	bestOverall := calcOverall(bestCatPts, bestCatPossible, true)
+
+	// Worst case: get 0% on assignment
+	worstCatPts := category.points
+	worstCatPossible := category.possible + assignmentPts
+	worstOverall := calcOverall(worstCatPts, worstCatPossible, true)
+
+	return &AssignmentImpact{
+		Gain: bestOverall - calcCurrentOverall,
+		Loss: calcCurrentOverall - worstOverall,
+	}
+}
+
+func calculateNonWeightedImpact(
+	totalPoints, totalPossible float64,
+	assignmentPts float64,
+	currentOverall float64,
+) *AssignmentImpact {
+	// Calculate current percentage consistently
+	var currentPct float64
+	if totalPossible > 0 {
+		currentPct = (totalPoints / totalPossible) * 100
+	}
+
+	// Best case: get 100% on assignment
+	bestPts := totalPoints + assignmentPts
+	bestPossible := totalPossible + assignmentPts
+	var bestPct float64
+	if bestPossible > 0 {
+		bestPct = (bestPts / bestPossible) * 100
+	}
+
+	// Worst case: get 0% on assignment
+	worstPts := totalPoints
+	worstPossible := totalPossible + assignmentPts
+	var worstPct float64
+	if worstPossible > 0 {
+		worstPct = (worstPts / worstPossible) * 100
+	}
+
+	return &AssignmentImpact{
+		Gain: bestPct - currentPct,
+		Loss: currentPct - worstPct,
+	}
+}
+
+func calculateGradedZeroWeightedImpact(
+	category *categoryState,
+	assignmentPts float64,
+	currentOverall float64,
+	allCategories map[int]*categoryState,
+) *AssignmentImpact {
+	// Zero-weight category has no impact
+	if category.weight == 0 {
+		return &AssignmentImpact{Gain: 0, Loss: 0}
+	}
+
+	// For graded-0 assignments, the 0 and possible are already in the totals
+	// Best case: improve from 0 to full points (add pts to earned, possible unchanged)
+	// Worst case: stay at 0 (no change, loss = 0)
+
+	// Helper to calculate overall grade with specified category values
+	calcOverall := func(catPoints, catPossible float64) float64 {
+		if catPossible == 0 {
+			return 0
+		}
+		catPct := (catPoints / catPossible) * 100
+
+		weightedSum := 0.0
+		weightSum := 0.0
+		for _, cat := range allCategories {
+			if cat == category {
+				weightedSum += catPct * cat.weight
+				weightSum += cat.weight
+			} else if cat.possible > 0 {
+				otherPct := (cat.points / cat.possible) * 100
+				weightedSum += otherPct * cat.weight
+				weightSum += cat.weight
+			}
+		}
+
+		if weightSum == 0 {
+			return 0
+		}
+		return weightedSum / weightSum
+	}
+
+	// Calculate current overall (with the 0 score in place)
+	calcCurrentOverall := calcOverall(category.points, category.possible)
+
+	// Best case: improve from 0 to full points
+	bestCatPts := category.points + assignmentPts // Add the points we'd gain
+	bestCatPossible := category.possible          // Possible unchanged (already includes this assignment)
+	bestOverall := calcOverall(bestCatPts, bestCatPossible)
+
+	return &AssignmentImpact{
+		Gain: bestOverall - calcCurrentOverall,
+		Loss: 0, // Already at worst for this assignment
+	}
+}
+
+func calculateGradedZeroNonWeightedImpact(
+	totalPoints, totalPossible float64,
+	assignmentPts float64,
+	currentOverall float64,
+) *AssignmentImpact {
+	// For graded-0 assignments, the 0 and possible are already in the totals
+	// Calculate current percentage consistently
+	var currentPct float64
+	if totalPossible > 0 {
+		currentPct = (totalPoints / totalPossible) * 100
+	}
+
+	// Best case: improve from 0 to full points
+	bestPts := totalPoints + assignmentPts
+	bestPossible := totalPossible // Possible unchanged
+	var bestPct float64
+	if bestPossible > 0 {
+		bestPct = (bestPts / bestPossible) * 100
+	}
+
+	return &AssignmentImpact{
+		Gain: bestPct - currentPct,
+		Loss: 0, // Already at worst for this assignment
+	}
+}
+
 func currentGradingPeriod(periods []GradingPeriod) *GradingPeriod {
 	now := time.Now()
 	for i := range periods {
@@ -667,7 +999,8 @@ func (r *Report) printTable(assignments []EnrichedAssignment, sectionType string
 		1: cw.assignment,
 		2: cw.due,
 		3: cw.pts,
-		4: cw.status,
+		4: cw.impact,
+		5: cw.status,
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
@@ -678,11 +1011,12 @@ func (r *Report) printTable(assignments []EnrichedAssignment, sectionType string
 			tw.AlignLeft,  // Assignment
 			tw.AlignLeft,  // Due
 			tw.AlignRight, // Pts
+			tw.AlignRight, // Impact
 			tw.AlignLeft,  // Status
 		}
 		cfg.Widths.PerColumn = widths
 	})
-	table.Header("Subject", "Assignment", "Due", "Pts", "")
+	table.Header("Subject", "Assignment", "Due", "Pts", "Impact", "")
 
 	red := color.New(color.FgRed)
 	green := color.New(color.FgGreen)
@@ -690,7 +1024,7 @@ func (r *Report) printTable(assignments []EnrichedAssignment, sectionType string
 
 	for _, a := range assignments {
 		subject := truncateString(a.CourseName, cw.subject)
-		name := truncateString(a.Name, cw.assignment)
+		name := formatAssignmentName(a.Name, a.CategoryName, cw.assignment, dim)
 		due := strings.ToLower(a.DueAt.Local().Format("Mon 1/2 3pm"))
 		pts := ""
 		if a.PointsPossible != nil {
@@ -698,27 +1032,88 @@ func (r *Report) printTable(assignments []EnrichedAssignment, sectionType string
 		}
 
 		if sectionType == "missing" {
+			impact := formatImpact(a.Impact)
 			var status string
 			if a.Status == "Missing" {
 				status = red.Sprint("✗")
 			} else {
 				status = red.Sprint("0")
 			}
-			table.Append(subject, name, due, pts, status)
+			table.Append(subject, name, due, pts, impact, status)
 		} else if isCompleted(a.Submission) {
+			// Don't show impact for completed assignments
 			table.Append(
 				dim.Sprint(subject),
 				dim.Sprint(name),
 				dim.Sprint(due),
 				dim.Sprint(pts),
+				"",
 				green.Sprint("✓"),
 			)
 		} else {
-			table.Append(subject, name, due, pts, "")
+			impact := formatImpact(a.Impact)
+			table.Append(subject, name, due, pts, impact, "")
 		}
 	}
 
 	table.Render()
+}
+
+func formatImpact(impact *AssignmentImpact) string {
+	if impact == nil {
+		return "-"
+	}
+
+	// Clamp to non-negative values (negative shouldn't occur in valid scenarios)
+	gain := impact.Gain
+	if gain < 0 {
+		gain = 0
+	}
+	loss := impact.Loss
+	if loss < 0 {
+		loss = 0
+	}
+
+	// Round to 1 decimal for display comparison
+	gainRounded := float64(int(gain*10+0.5)) / 10
+	lossRounded := float64(int(loss*10+0.5)) / 10
+
+	hasGain := gainRounded >= 0.1
+	hasLoss := lossRounded >= 0.1
+
+	if !hasGain && !hasLoss {
+		return "-"
+	}
+	if hasGain && !hasLoss {
+		return fmt.Sprintf("+%.1f%%", gain)
+	}
+	if !hasGain && hasLoss {
+		return fmt.Sprintf("-%.1f%%", loss)
+	}
+	return fmt.Sprintf("+%.1f/-%.1f%%", gain, loss)
+}
+
+func formatAssignmentName(name, category string, maxWidth int, dim *color.Color) string {
+	if category == "" {
+		return truncateString(name, maxWidth)
+	}
+
+	// Combine name and category, then truncate wherever it lands
+	suffix := " (" + category + ")"
+	full := name + suffix
+
+	if len(full) <= maxWidth {
+		return name + dim.Sprint(suffix)
+	}
+
+	// Truncate the combined string
+	truncated := truncateString(full, maxWidth)
+
+	// Find where the dim part should start (if suffix is still partially visible)
+	if len(truncated) > len(name) {
+		return name + dim.Sprint(truncated[len(name):])
+	}
+	return truncated
 }
 
 func (r *Report) printGrades(grades []periodGrades) {

@@ -545,12 +545,10 @@ func (r *Report) printReport(data studentData, colWidths columnWidths) {
 		r.printTable(data.upcoming, "upcoming", colWidths)
 	}
 
-	// Week Ahead section
-	fmt.Println()
-	cyan.Printf("WEEK AHEAD (%d pending)\n", data.weekAheadPending)
-	if len(data.weekAhead) == 0 {
-		dim.Println("  Nothing else due this week.")
-	} else {
+	// Week Ahead section (only show if there are assignments)
+	if len(data.weekAhead) > 0 {
+		fmt.Println()
+		cyan.Printf("WEEK AHEAD (%d pending)\n", data.weekAheadPending)
 		r.printTable(data.weekAhead, "week_ahead", colWidths)
 	}
 

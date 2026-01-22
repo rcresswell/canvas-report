@@ -123,6 +123,16 @@ type CourseGrade struct {
 	Points         float64
 	PointsPossible float64
 	Percent        float64
+	Weighted       bool
+	Categories     []CategoryGrade
+}
+
+type CategoryGrade struct {
+	Name           string
+	Points         float64
+	PointsPossible float64
+	Percent        float64
+	Weight         float64
 }
 
 func NewReport(client *CanvasClient, showAll bool) *Report {
@@ -384,20 +394,38 @@ func (r *Report) fetchCourseGrade(course Course, studentID int) (*GradingPeriod,
 	}
 
 	percent := *enrollment.Grades.CurrentScore
-	points := 0.0
-	if enrollment.Grades.CurrentPoints != nil {
-		points = *enrollment.Grades.CurrentPoints
-	}
-
-	// Calculate points possible from points and percent
-	pointsPossible := 0.0
-	if percent > 0 {
-		pointsPossible = points / (percent / 100)
-	}
 
 	courseName := course.Name
 	if courseName == "" {
 		courseName = "Unknown Course"
+	}
+
+	// Check if course uses weighted grading
+	groups, err := r.client.AssignmentGroups(course.ID)
+	if err != nil {
+		groups = nil
+	}
+
+	weighted := isWeightedGrading(groups)
+
+	if weighted {
+		categories := r.buildCategoryGrades(course.ID, studentID, groups)
+		return current, &CourseGrade{
+			CourseName: courseName,
+			Percent:    percent,
+			Weighted:   true,
+			Categories: categories,
+		}
+	}
+
+	// Non-weighted: calculate points from submissions
+	points := 0.0
+	if enrollment.Grades.CurrentPoints != nil {
+		points = *enrollment.Grades.CurrentPoints
+	}
+	pointsPossible := 0.0
+	if percent > 0 {
+		pointsPossible = points / (percent / 100)
 	}
 
 	return current, &CourseGrade{
@@ -405,7 +433,67 @@ func (r *Report) fetchCourseGrade(course Course, studentID int) (*GradingPeriod,
 		Points:         points,
 		PointsPossible: pointsPossible,
 		Percent:        percent,
+		Weighted:       false,
 	}
+}
+
+func isWeightedGrading(groups []AssignmentGroup) bool {
+	for _, g := range groups {
+		if g.GroupWeight > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Report) buildCategoryGrades(courseID, studentID int, groups []AssignmentGroup) []CategoryGrade {
+	// Get submissions to calculate points per category
+	submissions, err := r.client.Submissions(courseID, studentID)
+	if err != nil {
+		return nil
+	}
+
+	// Build map of assignment ID -> score
+	scoreByAssignment := make(map[int]float64)
+	for _, sub := range submissions {
+		if sub.Score != nil {
+			scoreByAssignment[sub.AssignmentID] = *sub.Score
+		}
+	}
+
+	var categories []CategoryGrade
+	for _, group := range groups {
+		if group.GroupWeight == 0 {
+			continue
+		}
+
+		var points, possible float64
+		for _, a := range group.Assignments {
+			if a.PointsPossible == nil || *a.PointsPossible == 0 {
+				continue
+			}
+			// Only count assignments that have been graded
+			if score, ok := scoreByAssignment[a.ID]; ok {
+				points += score
+				possible += *a.PointsPossible
+			}
+		}
+
+		pct := 0.0
+		if possible > 0 {
+			pct = (points / possible) * 100
+		}
+
+		categories = append(categories, CategoryGrade{
+			Name:           group.Name,
+			Points:         points,
+			PointsPossible: possible,
+			Percent:        pct,
+			Weight:         group.GroupWeight,
+		})
+	}
+
+	return categories
 }
 
 func currentGradingPeriod(periods []GradingPeriod) *GradingPeriod {
@@ -635,10 +723,9 @@ func (r *Report) printGrades(grades []periodGrades) {
 	}
 
 	magenta := color.New(color.FgMagenta, color.Bold)
+	dim := color.New(color.Faint)
 
 	for _, pg := range grades {
-		fmt.Println()
-
 		// Format period header
 		periodName := pg.period.Title
 		if periodName == "" {
@@ -650,6 +737,8 @@ func (r *Report) printGrades(grades []periodGrades) {
 				pg.period.StartDate.Local().Format("Jan 2"),
 				pg.period.EndDate.Local().Format("Jan 2"))
 		}
+
+		fmt.Println()
 		magenta.Printf("GRADES - %s%s\n", periodName, dateRange)
 
 		table := tablewriter.NewWriter(os.Stdout)
@@ -657,20 +746,43 @@ func (r *Report) printGrades(grades []periodGrades) {
 			cfg.Row.Formatting.AutoWrap = tw.WrapTruncate
 			cfg.Row.Alignment.PerColumn = []tw.Align{
 				tw.AlignLeft,  // Subject
+				tw.AlignRight, // %
 				tw.AlignRight, // Points
 				tw.AlignRight, // Possible
-				tw.AlignRight, // %
+				tw.AlignRight, // Weight
 			}
 		})
-		table.Header("Subject", "Points", "Possible", "%")
+		table.Header("Subject", "%", "Points", "Possible", "Weight")
 
 		for _, g := range pg.grades {
-			table.Append(
-				g.CourseName,
-				fmt.Sprintf("%.0f", g.Points),
-				fmt.Sprintf("%.0f", g.PointsPossible),
-				fmt.Sprintf("%.2f%%", g.Percent),
-			)
+			if g.Weighted {
+				// Weighted course: summary row, then indented categories
+				table.Append(
+					g.CourseName,
+					fmt.Sprintf("%.2f%%", g.Percent),
+					"",
+					"",
+					"",
+				)
+				for _, cat := range g.Categories {
+					table.Append(
+						dim.Sprintf("  %s", cat.Name),
+						dim.Sprintf("%.2f%%", cat.Percent),
+						dim.Sprintf("%.0f", cat.Points),
+						dim.Sprintf("%.0f", cat.PointsPossible),
+						dim.Sprintf("%.0f%%", cat.Weight),
+					)
+				}
+			} else {
+				// Non-weighted course: simple row
+				table.Append(
+					g.CourseName,
+					fmt.Sprintf("%.2f%%", g.Percent),
+					fmt.Sprintf("%.0f", g.Points),
+					fmt.Sprintf("%.0f", g.PointsPossible),
+					"",
+				)
+			}
 		}
 
 		table.Render()

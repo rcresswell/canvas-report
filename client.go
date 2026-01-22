@@ -62,6 +62,19 @@ type Enrollment struct {
 	} `json:"grades"`
 }
 
+type AssignmentGroup struct {
+	ID          int                   `json:"id"`
+	Name        string                `json:"name"`
+	GroupWeight float64               `json:"group_weight"`
+	Assignments []AssignmentInGroup   `json:"assignments"`
+}
+
+type AssignmentInGroup struct {
+	ID             int      `json:"id"`
+	Name           string   `json:"name"`
+	PointsPossible *float64 `json:"points_possible"`
+}
+
 func NewCanvasClient(baseURL, accessToken string) *CanvasClient {
 	return &CanvasClient{
 		baseURL:     strings.TrimSuffix(baseURL, "/"),
@@ -135,6 +148,13 @@ func (c *CanvasClient) Enrollments(courseID, studentID int, gradingPeriodID stri
 		params.Set("grading_period_id", gradingPeriodID)
 	}
 	return getPaginated[Enrollment](c, fmt.Sprintf("/api/v1/courses/%d/enrollments", courseID), params)
+}
+
+func (c *CanvasClient) AssignmentGroups(courseID int) ([]AssignmentGroup, error) {
+	params := url.Values{
+		"include[]": []string{"assignments"},
+	}
+	return getPaginated[AssignmentGroup](c, fmt.Sprintf("/api/v1/courses/%d/assignment_groups", courseID), params)
 }
 
 func getPaginated[T any](c *CanvasClient, path string, params url.Values) ([]T, error) {

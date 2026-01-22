@@ -493,6 +493,10 @@ func (r *Report) buildCategoryGrades(courseID, studentID int, groups []Assignmen
 		})
 	}
 
+	sort.Slice(categories, func(i, j int) bool {
+		return categories[i].Name < categories[j].Name
+	})
+
 	return categories
 }
 

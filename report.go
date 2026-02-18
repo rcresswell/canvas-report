@@ -296,14 +296,15 @@ func (r *Report) fetchCourseAssignments(course Course, studentID int) ([]Enriche
 		groups = nil // Continue without impact if groups fail
 	}
 
-	// Get current grade for impact calculation
+	// Get current grade and grading period for impact calculation
 	var currentOverall float64
+	var currentPeriod *GradingPeriod
 	weighted := isWeightedGrading(groups)
 	if groups != nil {
 		periods, _ := r.client.GradingPeriods(course.ID)
-		current := currentGradingPeriod(periods)
-		if current != nil {
-			periodID := fmt.Sprintf("%v", current.ID)
+		currentPeriod = currentGradingPeriod(periods)
+		if currentPeriod != nil {
+			periodID := fmt.Sprintf("%v", currentPeriod.ID)
 			enrollments, _ := r.client.Enrollments(course.ID, studentID, periodID)
 			if len(enrollments) > 0 && enrollments[0].Grades.CurrentScore != nil {
 				currentOverall = *enrollments[0].Grades.CurrentScore
@@ -314,7 +315,7 @@ func (r *Report) fetchCourseAssignments(course Course, studentID int) ([]Enriche
 	// Calculate impacts
 	var impacts map[int]*AssignmentImpact
 	if groups != nil {
-		impacts = calculateAssignmentImpacts(groups, rawSubmissions, currentOverall, weighted)
+		impacts = calculateAssignmentImpacts(groups, rawSubmissions, currentOverall, weighted, currentPeriod)
 	}
 
 	// Build map of assignment ID to category name (only for weighted courses)
@@ -460,7 +461,7 @@ func (r *Report) fetchCourseGrade(course Course, studentID int) (*GradingPeriod,
 	weighted := isWeightedGrading(groups)
 
 	if weighted {
-		categories := r.buildCategoryGrades(course.ID, studentID, groups)
+		categories := r.buildCategoryGrades(course.ID, studentID, groups, current)
 		return current, &CourseGrade{
 			CourseName: courseName,
 			Percent:    percent,
@@ -497,7 +498,7 @@ func isWeightedGrading(groups []AssignmentGroup) bool {
 	return false
 }
 
-func (r *Report) buildCategoryGrades(courseID, studentID int, groups []AssignmentGroup) []CategoryGrade {
+func (r *Report) buildCategoryGrades(courseID, studentID int, groups []AssignmentGroup, period *GradingPeriod) []CategoryGrade {
 	// Get submissions to calculate points per category
 	submissions, err := r.client.Submissions(courseID, studentID)
 	if err != nil {
@@ -521,6 +522,9 @@ func (r *Report) buildCategoryGrades(courseID, studentID int, groups []Assignmen
 		var points, possible float64
 		for _, a := range group.Assignments {
 			if a.PointsPossible == nil || *a.PointsPossible == 0 {
+				continue
+			}
+			if !assignmentInPeriod(a, period) {
 				continue
 			}
 			// Only count assignments that have been graded
@@ -568,6 +572,7 @@ func calculateAssignmentImpacts(
 	submissions []Submission,
 	currentOverall float64,
 	weighted bool,
+	period *GradingPeriod,
 ) map[int]*AssignmentImpact {
 	impacts := make(map[int]*AssignmentImpact)
 
@@ -608,6 +613,9 @@ func calculateAssignmentImpacts(
 			if a.PointsPossible == nil || *a.PointsPossible == 0 {
 				continue
 			}
+			if !assignmentInPeriod(a, period) {
+				continue
+			}
 			if graded, score := isGraded(a.ID); graded {
 				state.points += score
 				state.possible += *a.PointsPossible
@@ -629,6 +637,9 @@ func calculateAssignmentImpacts(
 	for _, group := range groups {
 		for _, a := range group.Assignments {
 			if a.PointsPossible == nil || *a.PointsPossible == 0 {
+				continue
+			}
+			if !assignmentInPeriod(a, period) {
 				continue
 			}
 
@@ -830,6 +841,16 @@ func calculateGradedZeroNonWeightedImpact(
 		Gain: bestPct - currentPct,
 		Loss: 0, // Already at worst for this assignment
 	}
+}
+
+func assignmentInPeriod(a AssignmentInGroup, period *GradingPeriod) bool {
+	if period == nil || period.StartDate == nil || period.EndDate == nil {
+		return true // No period info, include everything
+	}
+	if a.DueAt == nil {
+		return true // No due date, include to be safe
+	}
+	return !a.DueAt.Before(*period.StartDate) && !a.DueAt.After(*period.EndDate)
 }
 
 func currentGradingPeriod(periods []GradingPeriod) *GradingPeriod {

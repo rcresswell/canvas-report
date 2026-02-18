@@ -70,9 +70,10 @@ type AssignmentGroup struct {
 }
 
 type AssignmentInGroup struct {
-	ID             int      `json:"id"`
-	Name           string   `json:"name"`
-	PointsPossible *float64 `json:"points_possible"`
+	ID             int        `json:"id"`
+	Name           string     `json:"name"`
+	PointsPossible *float64   `json:"points_possible"`
+	DueAt          *time.Time `json:"due_at"`
 }
 
 func NewCanvasClient(baseURL, accessToken string) *CanvasClient {

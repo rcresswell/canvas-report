@@ -883,7 +883,8 @@ func (r *Report) missingAssignments(assignments []EnrichedAssignment) []Enriched
 		}
 
 		sub := a.Submission
-		isMissing := sub == nil || sub.Missing || (sub.Score != nil && *sub.Score == 0 && sub.GradedAt != nil)
+		unsubmitted := sub != nil && sub.SubmittedAt == nil && sub.GradedAt == nil && !sub.Excused
+		isMissing := sub == nil || sub.Missing || unsubmitted || (sub.Score != nil && *sub.Score == 0 && sub.GradedAt != nil)
 
 		if isMissing && !awaitingGrade(sub) {
 			enriched := a
@@ -1223,7 +1224,10 @@ func awaitingGrade(sub *Submission) bool {
 	if sub.SubmittedAt == nil {
 		return false
 	}
-	return sub.GradeMatchesCurrentSubmission != nil && !*sub.GradeMatchesCurrentSubmission
+	if sub.GradeMatchesCurrentSubmission != nil && !*sub.GradeMatchesCurrentSubmission {
+		return true
+	}
+	return sub.GradedAt == nil && !sub.Excused
 }
 
 func determineStatus(a EnrichedAssignment) string {
